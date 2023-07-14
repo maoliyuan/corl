@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import random
 import uuid
-
+from collections import defaultdict
 import d4rl
 import gym
 import numpy as np
@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+from tqdm import tqdm
 
 TensorBatch = List[torch.Tensor]
 
@@ -23,11 +24,11 @@ TensorBatch = List[torch.Tensor]
 @dataclass
 class TrainConfig:
     # Experiment
-    device: str = "cuda"
-    env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
+    device: str = "cuda:0"
+    env: str = "hopper-medium-replay-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
-    eval_freq: int = int(5e3)  # How often (time steps) we evaluate
-    n_episodes: int = 10  # How many episodes run during evaluation
+    eval_freq: int = int(1e4)  # How often (time steps) we evaluate
+    n_episodes: int = 50  # How many episodes run during evaluation
     max_timesteps: int = int(1e6)  # Max time steps to run environment
     checkpoints_path: Optional[str] = None  # Save path
     load_model: str = ""  # Model load file name, "" doesn't load
@@ -40,10 +41,14 @@ class TrainConfig:
     policy_noise: float = 0.2  # Noise added to target actor during critic update
     noise_clip: float = 0.5  # Range to clip target actor noise
     policy_freq: int = 2  # Frequency of delayed actor updates
+    ita: float = 0.1
     # TD3 + BC
     alpha: float = 2.5  # Coefficient for Q function in actor loss
     normalize: bool = True  # Normalize states
     normalize_reward: bool = False  # Normalize reward
+    use_residual_grad: bool = False
+    grad_bidirectional: bool = False
+    grad_mode: str = "verticle"
     # Wandb logging
     project: str = "CORL"
     group: str = "TD3_BC-D4RL"
@@ -249,18 +254,17 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
         super(Critic, self).__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+        self.fc1 = nn.Linear(state_dim + action_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, 1)
+        self.activation = nn.ReLU()
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         sa = torch.cat([state, action], 1)
-        return self.net(sa)
+        x = self.activation(self.fc1(sa))
+        x = self.activation(self.fc2(x))
+        value = self.fc3(x)
+        return value
 
 
 class TD3_BC:  # noqa
@@ -270,15 +274,18 @@ class TD3_BC:  # noqa
         actor: nn.Module,
         actor_optimizer: torch.optim.Optimizer,
         critic_1: nn.Module,
-        critic_1_optimizer: torch.optim.Optimizer,
         critic_2: nn.Module,
-        critic_2_optimizer: torch.optim.Optimizer,
+        critic_optimizer: torch.optim.Optimizer,
         discount: float = 0.99,
         tau: float = 0.005,
         policy_noise: float = 0.2,
         noise_clip: float = 0.5,
         policy_freq: int = 2,
         alpha: float = 2.5,
+        ita: float = 0.1,
+        use_residual_grad: bool = False,
+        grad_bidirectional: bool = False,
+        grad_mode: str = "verticle",
         device: str = "cpu",
     ):
         self.actor = actor
@@ -286,10 +293,11 @@ class TD3_BC:  # noqa
         self.actor_optimizer = actor_optimizer
         self.critic_1 = critic_1
         self.critic_1_target = copy.deepcopy(critic_1)
-        self.critic_1_optimizer = critic_1_optimizer
         self.critic_2 = critic_2
         self.critic_2_target = copy.deepcopy(critic_2)
-        self.critic_2_optimizer = critic_2_optimizer
+        self.critic_optimizer = critic_optimizer
+        self.state_feature = []
+        self.critic_1.fc2.register_forward_hook(self.get_activation())
 
         self.max_action = max_action
         self.discount = discount
@@ -298,6 +306,10 @@ class TD3_BC:  # noqa
         self.noise_clip = noise_clip
         self.policy_freq = policy_freq
         self.alpha = alpha
+        self.ita = ita
+        self.use_residual_grad = use_residual_grad
+        self.grad_bidirectional = grad_bidirectional
+        self.grad_mode = grad_mode
 
         self.total_it = 0
         self.device = device
@@ -320,24 +332,71 @@ class TD3_BC:  # noqa
             )
 
             # Compute the target Q value
-            target_q1 = self.critic_1_target(next_state, next_action)
-            target_q2 = self.critic_2_target(next_state, next_action)
-            target_q = torch.min(target_q1, target_q2)
-            target_q = reward + not_done * self.discount * target_q
+            target_q1_next = self.critic_1_target(next_state, next_action)
+            target_q2_next = self.critic_2_target(next_state, next_action)
+            target_q_next = torch.min(target_q1_next, target_q2_next)
+            target_q_next = reward + not_done * self.discount * target_q_next
+            if self.use_residual_grad:
+                target_q1 = self.critic_1_target(state, action)
+                target_q2 = self.critic_2_target(state, action)
+                target_q = torch.min(target_q1, target_q2)
 
         # Get current Q estimates
         current_q1 = self.critic_1(state, action)
         current_q2 = self.critic_2(state, action)
+        next_q1 = reward + not_done * self.discount * self.critic_1(next_state, next_action)
+        next_q2 = reward + not_done * self.discount * self.critic_2(next_state, next_action)
 
         # Compute critic loss
-        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+        if not self.use_residual_grad:
+            critic_loss = F.mse_loss(current_q1, target_q_next) + F.mse_loss(current_q2, target_q_next)
+        elif not self.grad_bidirectional:
+            critic_loss = F.mse_loss(current_q1, next_q1) + F.mse_loss(current_q2, next_q2)
+        else:
+            forward_loss = F.mse_loss(current_q1, target_q_next) + F.mse_loss(current_q2, target_q_next)
+            backward_loss = self.ita * (F.mse_loss(target_q, next_q1) + F.mse_loss(target_q, next_q1))
+            critic_loss = forward_loss
+
+        if self.use_residual_grad and self.grad_bidirectional:
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            forward_grad_list, backward_grad_list = [], []
+            forward_loss.backward()
+            for param in list(self.critic_1.parameters()) + list(self.critic_2.parameters()):
+                forward_grad_list.append(param.grad.clone().detach().reshape(-1))
+            backward_loss.backward()
+            for i, param in enumerate(list(self.critic_1.parameters()) + list(self.critic_2.parameters())):
+                backward_grad_list.append(param.grad.clone().detach().reshape(-1) - forward_grad_list[i])
+            forward_grad, backward_grad = torch.cat(forward_grad_list), torch.cat(backward_grad_list)
+            parallel_coef = (torch.dot(forward_grad, backward_grad) / max(torch.dot(forward_grad, forward_grad), 1e-10)).item() # avoid zero grad caused by f*
+            if self.grad_mode == "conservative":
+                forward_grad = (1 - max(parallel_coef, 0)) * forward_grad + backward_grad
+            elif self.grad_mode == "aggressive":
+                forward_grad = (1 - min(parallel_coef, 0)) * forward_grad + backward_grad
+            elif self.grad_mode == "verticle":
+                forward_grad = (1 - parallel_coef) * forward_grad + backward_grad
+            else:
+                forward_grad = forward_grad + backward_grad
+
+            param_idx = 0
+            for i, grad in enumerate(forward_grad_list):
+                forward_grad_list[i] = forward_grad[param_idx: param_idx+grad.shape[0]]
+                param_idx += grad.shape[0]
+            # reset gradient and calculate
+            self.critic_optimizer.zero_grad()
+            for i, param in enumerate(list(self.critic_1.parameters()) + list(self.critic_2.parameters())):
+                param.grad = forward_grad_list[i].reshape(param.grad.shape)
+
+            self.critic_optimizer.step()
+        else:
+            # Optimize the critic
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic_optimizer.step()
+
+        feature_cosine_similarity = torch.mean(torch.nn.functional.cosine_similarity(self.state_feature[0], self.state_feature[1], dim=1)).item()
         log_dict["critic_loss"] = critic_loss.item()
-        # Optimize the critic
-        self.critic_1_optimizer.zero_grad()
-        self.critic_2_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_1_optimizer.step()
-        self.critic_2_optimizer.step()
+        log_dict["cosine_sim_mean"] = feature_cosine_similarity
+        self.state_feature.clear()
 
         # Delayed actor updates
         if self.total_it % self.policy_freq == 0:
@@ -359,6 +418,11 @@ class TD3_BC:  # noqa
             soft_update(self.actor_target, self.actor, self.tau)
 
         return log_dict
+    
+    def get_activation(self):
+        def hook(model, input, output):
+            self.state_feature.append(output.detach())
+        return hook
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -390,6 +454,7 @@ class TD3_BC:  # noqa
 @pyrallis.wrap()
 def train(config: TrainConfig):
     env = gym.make(config.env)
+    assert config.grad_mode in ["verticle", "aggressive", "conservative"]
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -435,18 +500,16 @@ def train(config: TrainConfig):
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=3e-4)
 
     critic_1 = Critic(state_dim, action_dim).to(config.device)
-    critic_1_optimizer = torch.optim.Adam(critic_1.parameters(), lr=3e-4)
     critic_2 = Critic(state_dim, action_dim).to(config.device)
-    critic_2_optimizer = torch.optim.Adam(critic_2.parameters(), lr=3e-4)
+    critic_optimizer = torch.optim.Adam(list(critic_1.parameters()) + list(critic_2.parameters()), lr=3e-4)
 
     kwargs = {
         "max_action": max_action,
         "actor": actor,
         "actor_optimizer": actor_optimizer,
         "critic_1": critic_1,
-        "critic_1_optimizer": critic_1_optimizer,
         "critic_2": critic_2,
-        "critic_2_optimizer": critic_2_optimizer,
+        "critic_optimizer": critic_optimizer,
         "discount": config.discount,
         "tau": config.tau,
         "device": config.device,
@@ -454,6 +517,10 @@ def train(config: TrainConfig):
         "policy_noise": config.policy_noise * max_action,
         "noise_clip": config.noise_clip * max_action,
         "policy_freq": config.policy_freq,
+        "ita": config.ita,
+        "use_residual_grad": config.use_residual_grad,
+        "grad_bidirectional": config.grad_bidirectional,
+        "grad_mode": config.grad_mode,
         # TD3 + BC
         "alpha": config.alpha,
     }
@@ -470,14 +537,16 @@ def train(config: TrainConfig):
         trainer.load_state_dict(torch.load(policy_file))
         actor = trainer.actor
 
-    wandb_init(asdict(config))
+    # wandb_init(asdict(config))
 
     evaluations = []
-    for t in range(int(config.max_timesteps)):
+    train_info = defaultdict(lambda: [])
+    for t in tqdm(range(config.max_timesteps)):
         batch = replay_buffer.sample(config.batch_size)
         batch = [b.to(config.device) for b in batch]
         log_dict = trainer.train(batch)
-        wandb.log(log_dict, step=trainer.total_it)
+        for key, value in list(log_dict.items()):
+            train_info[key].append(value)
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
             print(f"Time steps: {t + 1}")
@@ -504,10 +573,16 @@ def train(config: TrainConfig):
                     os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
                 )
 
-            wandb.log(
-                {"d4rl_normalized_score": normalized_eval_score},
-                step=trainer.total_it,
-            )
+            # wandb.log(
+            #     {"d4rl_normalized_score": normalized_eval_score},
+            #     step=trainer.total_it,
+            # )
+            # for key, value_list in list(train_info.items()):
+            #     if key == "cosine_sim_mean":
+            #         train_info["cosine_sim_std"] = np.std(value_list)
+            #     train_info[key] = np.mean(value_list)
+            # wandb.log(train_info, step=trainer.total_it)
+            train_info = defaultdict(lambda: [])
 
 
 if __name__ == "__main__":

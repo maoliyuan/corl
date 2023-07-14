@@ -20,3 +20,7 @@ policy_noise: 0.2
 project: CORL
 seed: 0
 tau: 0.005
+ita: 0.1
+use_residual_grad: false
+grad_bidirectional: false
+grad_mode: verticle
